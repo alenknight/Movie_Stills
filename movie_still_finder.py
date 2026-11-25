@@ -21,6 +21,12 @@ from openai import OpenAI
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+try:
+    from tkinterdnd2 import COPY, DND_FILES, TkinterDnD
+except ImportError:
+    TkinterDnD = None  # Existing installations can still load movies with Add files.
+
+WindowRoot = TkinterDnD.Tk if TkinterDnD else tk.Tk
 
 
 VIDEO_EXTENSIONS = {
@@ -29,7 +35,7 @@ VIDEO_EXTENSIONS = {
 }
 
 HELP_ITEMS = (
-    ("A", "Add files", "Choose one or several movie files and add them to the Movies list."),
+    ("A", "Add files", "Choose movie files, or drop them onto the main window from Finder or File Explorer."),
     ("B", "Add folder", "Find supported movie files inside a folder and its subfolders."),
     ("C", "Clear", "Remove every loaded movie from the app. Source files are never deleted."),
     ("D", "Output", "Shows where extracted still images will be saved."),
@@ -42,7 +48,7 @@ HELP_ITEMS = (
     ("K", "Confidence", "Only keeps GPT marker matches at or above this score."),
     ("L", "Video preview", "Displays the currently selected movie at the playhead position."),
     ("M", "Clip details", "Shows frame rate, resolution, total frame count, and seconds per frame."),
-    ("N", "Play / Pause", "Starts or pauses playback of the selected movie."),
+    ("N", "Play / Pause", "Starts or pauses playback. Click the preview and press Left or Right to pause and step one frame."),
     ("O", "Previous marker", "Jumps to the previous marker, wrapping from the first to the last."),
     ("P", "Next marker", "Jumps to the next marker, wrapping from the last to the first."),
     ("Q", "Timeline", "Click or drag to scrub. Yellow triangles are markers; the blue line is the playhead."),
@@ -74,9 +80,21 @@ class Match:
     seconds: float
     confidence: float
     reason: str
+    frame_index: int
+    source: str
 
 
 @dataclass
+class Review:
+    transcript: str = ""
+    response_id: str = ""
+    samples: dict[float, int] = field(default_factory=dict)
+    recommendations: set[int] = field(default_factory=set)
+    busy: bool = False
+    draft: str = ""
+
+
+@dataclass(eq=False)
 class VideoItem:
     path: Path
     duration: float = 0.0
@@ -85,6 +103,13 @@ class VideoItem:
     width: int = 0
     height: int = 0
     matches: list[Match] = field(default_factory=list)
+    review: Review = field(default_factory=Review)
+
+    def index_at(self, seconds: float) -> int:
+        return max(0, min(self.frame_count - 1, round(seconds * self.fps)))
+
+    def marker(self, index: int, source: str, reason: str, confidence: float = 1.0) -> Match:
+        return Match(index / self.fps if self.fps else 0, confidence, reason, index, source)
 
 
 def format_time(seconds: float) -> str:
@@ -110,21 +135,22 @@ def inspect_video(path: Path) -> VideoItem:
     return VideoItem(path=path, duration=duration, fps=fps, frame_count=count, width=width, height=height)
 
 
-def read_frame(path: Path, seconds: float) -> tuple[bool, object]:
-    capture = cv2.VideoCapture(str(path))
-    capture.set(cv2.CAP_PROP_POS_MSEC, max(0, seconds) * 1000)
-    ok, frame = capture.read()
-    capture.release()
-    return ok, frame
-
-
 def read_frame_number(path: Path, frame_number: int) -> tuple[bool, object]:
-    """Read an exact numbered frame, used where timestamp seeking can round."""
     capture = cv2.VideoCapture(str(path))
-    capture.set(cv2.CAP_PROP_POS_FRAMES, max(0, frame_number))
-    ok, frame = capture.read()
-    capture.release()
-    return ok, frame
+    try:
+        if capture.set(cv2.CAP_PROP_POS_FRAMES, frame_number):
+            ok, frame = capture.read()
+            if ok and round(capture.get(cv2.CAP_PROP_POS_FRAMES)) == frame_number + 1:
+                return True, frame
+        # Some codecs cannot report a reliable seek position. Count from the start.
+        capture.release()
+        capture = cv2.VideoCapture(str(path))
+        for _ in range(frame_number):
+            if not capture.grab():
+                return False, None
+        return capture.read()
+    finally:
+        capture.release()
 
 
 def select_review_times(video: VideoItem, maximum: int, mode: str) -> list[float]:
@@ -192,7 +218,7 @@ def frame_data_url(frame: object, max_width: int = 768) -> str:
 
 
 class MarkerScale(tk.Canvas):
-    def __init__(self, parent: tk.Widget, seek: Callable[[float], None], add: Callable[[float], None], remove: Callable[[float], None]):
+    def __init__(self, parent: tk.Widget, seek: Callable[[float], None], add: Callable[[], None], remove: Callable[[float], None]):
         super().__init__(parent, height=42, background="#202124", highlightthickness=0)
         self.duration = 0.0
         self.position = 0.0
@@ -213,7 +239,9 @@ class MarkerScale(tk.Canvas):
 
     def set_position(self, position: float) -> None:
         self.position = position
-        self.redraw()
+        if self.duration > 0:
+            x = position / self.duration * max(1, self.winfo_width())
+            self.coords("playhead", x, 0, x, max(1, self.winfo_height()))
 
     def _clicked(self, event: tk.Event) -> None:
         if self.duration > 0:
@@ -230,7 +258,7 @@ class MarkerScale(tk.Canvas):
         if self.duration > 0:
             seconds = self._seconds_at(event.x)
             self.seek(seconds)
-            self.add(seconds)
+            self.add()
 
     def _remove_clicked(self, event: tk.Event) -> None:
         if self.duration > 0:
@@ -244,20 +272,20 @@ class MarkerScale(tk.Canvas):
             return
         for match in self.matches:
             x = match.seconds / self.duration * width
-            if match.reason == "First frame":
+            if match.source == "endpoint" and match.reason == "First frame":
                 # Tip is exactly at time zero; the body extends into the canvas.
                 self.create_polygon(0, 2, 0, 15, 12, 15, fill="#ffcc00", outline="")
-            elif match.reason == "Last frame":
+            elif match.source == "endpoint" and match.reason == "Last frame":
                 # Tip is exactly at the final frame; the body extends inward.
                 self.create_polygon(width, 2, width - 12, 15, width, 15, fill="#ffcc00", outline="")
             else:
                 x = max(7, min(width - 7, x))
                 self.create_polygon(x, 2, x - 6, 15, x + 6, 15, fill="#ffcc00", outline="")
         x = self.position / self.duration * width
-        self.create_line(x, 0, x, height, fill="#52a7ff", width=3)
+        self.create_line(x, 0, x, height, fill="#52a7ff", width=3, tags="playhead")
 
 
-class MovieStillFinder(tk.Tk):
+class MovieStillFinder(WindowRoot):
     def __init__(self) -> None:
         super().__init__()
         self.title("Movie Still Finder")
@@ -273,15 +301,14 @@ class MovieStillFinder(tk.Tk):
         self.photo: ImageTk.PhotoImage | None = None
         self.playing = False
         self.position = 0.0
-        self.last_review_response_id: str | None = None
-        self.last_review_movie_name = ""
-        self.last_review_video: VideoItem | None = None
         self.help_window: tk.Toplevel | None = None
         self.help_text_widget: tk.Text | None = None
         self.help_search = tk.StringVar()
         self.help_result_count = tk.StringVar()
         self.help_search_trace: str | None = None
-        self.last_tick = time.monotonic()
+        self.play_job: str | None = None
+        self.frame_index = -1
+        self.next_deadline = 0.0
         self.events: queue.Queue = queue.Queue()
         self.output_dir = tk.StringVar()
         self.api_key = tk.StringVar(value=os.getenv("OPENAI_API_KEY", ""))
@@ -297,6 +324,16 @@ class MovieStillFinder(tk.Tk):
         self.video_info = tk.StringVar(value="FPS: —  •  Resolution: —  •  Frames: —  •  Seconds/frame: —")
         self.sample_equivalent = tk.StringVar(value="Select a movie to see the frame interval in seconds.")
         self._build_ui()
+        self._review_buttons()
+        if TkinterDnD:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._drop_movies)
+        else:
+            self._set_status("Add files is ready. Install tkinterdnd2 to enable desktop file drops.")
+        for key, step in (("Left", -1), ("Right", 1), ("KP_Left", -1), ("KP_Right", 1),
+                          ("KP_4", -1), ("KP_6", 1)):
+            self.bind(f"<{key}>", lambda event, delta=step: self._step_key(event, delta))
+        self.video_canvas.bind("<Button-1>", lambda _: self.video_canvas.focus_set())
         self.frame_interval.trace_add("write", lambda *_args: self._update_sample_equivalent())
         self.sample_mode.trace_add("write", lambda *_args: self._update_sample_equivalent())
         self.after(100, self._poll_events)
@@ -426,7 +463,7 @@ class MovieStillFinder(tk.Tk):
         followup_box.pack(fill="x", pady=(6, 0))
         self.followup_text = tk.Text(followup_box, height=2, wrap="word", font=("TkDefaultFont", 12))
         self.followup_text.pack(fill="x")
-        self.followup_text.insert("1.0", "Example: Rank these for dynamic action frames.")
+
         followup_actions = ttk.Frame(followup_box)
         followup_actions.pack(fill="x", pady=(6, 0))
         self.recommend_button = ttk.Button(
@@ -480,6 +517,15 @@ class MovieStillFinder(tk.Tk):
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(title="Choose movie files")
         self._add_paths([Path(p) for p in paths])
+
+    def _drop_movies(self, event) -> str:
+        paths = [Path(name) for name in self.tk.splitlist(event.data)]
+        movies = [p for p in paths if p.suffix.lower() in VIDEO_EXTENSIONS and p.is_file()]
+        if movies:
+            self._add_paths(movies)
+        else:
+            self._set_status("Drop a supported movie file to load it.")
+        return COPY
 
     def toggle_help(self) -> None:
         if self.help_window and self.help_window.winfo_exists():
@@ -625,11 +671,13 @@ class MovieStillFinder(tk.Tk):
         self.events.put(("index_done", None))
 
     def clear_files(self) -> None:
-        self.playing = False
+        self._pause()
+        self.frame_index = -1
         if self.capture:
             self.capture.release()
         self.capture = None
         self.current = None
+        self._show_review()
         self.videos.clear()
         self.file_list.delete(0, "end")
         self.video_canvas.delete("all")
@@ -657,20 +705,12 @@ class MovieStillFinder(tk.Tk):
 
     @staticmethod
     def _set_end_matches(video: VideoItem, enabled: bool) -> None:
-        video.matches = [
-            match for match in video.matches if match.reason not in {"First frame", "Last frame"}
-        ]
-        if not enabled:
-            return
-        if video.fps > 0 and video.frame_count > 0:
-            last_frame_time = (video.frame_count - 1) / video.fps
-        else:
-            last_frame_time = max(0.0, video.duration - .001)
-        endpoints = ((0.0, "First frame"), (last_frame_time, "Last frame"))
-        for seconds, reason in endpoints:
-            if not any(abs(match.seconds - seconds) < .05 for match in video.matches):
-                video.matches.append(Match(seconds, 1.0, reason))
-        video.matches.sort(key=lambda match: match.seconds)
+        video.matches = [match for match in video.matches if match.source != "endpoint"]
+        if enabled and video.frame_count > 0:
+            video.matches.append(video.marker(0, "endpoint", "First frame"))
+            if video.frame_count > 1:
+                video.matches.append(video.marker(video.frame_count - 1, "endpoint", "Last frame"))
+        video.matches.sort(key=lambda match: match.frame_index)
 
     def toggle_end_markers(self) -> None:
         enabled = bool(self.include_ends.get())
@@ -685,7 +725,12 @@ class MovieStillFinder(tk.Tk):
         selected = self.file_list.curselection()
         if not selected:
             return
+        self._pause()
+        self.frame_index = -1
+        if self.current:
+            self.current.review.draft = self.followup_text.get("1.0", "end-1c")
         self.current = self.videos[selected[0]]
+        self._show_review()
         self._set_end_matches(self.current, bool(self.include_ends.get()))
         if self.capture:
             self.capture.release()
@@ -722,38 +767,63 @@ class MovieStillFinder(tk.Tk):
         self.status_bar.configure(background=colors.get(kind, colors["neutral"]))
 
     def seek(self, seconds: float) -> None:
-        if not self.current:
-            return
-        self.position = max(0, min(seconds, self.current.duration))
-        last_frame_time = (
-            (self.current.frame_count - 1) / self.current.fps
-            if self.current.fps > 0 and self.current.frame_count > 0
-            else self.current.duration
-        )
-        half_frame = .5 / self.current.fps if self.current.fps > 0 else .001
-        if self.position <= half_frame:
-            ok, frame = read_frame_number(self.current.path, 0)
-        elif self.current.frame_count > 0 and abs(self.position - last_frame_time) <= half_frame:
-            ok, frame = read_frame_number(self.current.path, self.current.frame_count - 1)
-        else:
-            ok, frame = read_frame(self.current.path, self.position)
-        if ok:
-            self._show_frame(frame)
-        self.marker.set_position(self.position)
-        self.time_label.configure(text=f"{format_time(self.position)} / {format_time(self.current.duration)}")
+        if self.current:
+            self._pause()
+            self._display_frame(round(seconds * self.current.fps))
 
-    def add_marker(self, seconds: float | None = None) -> None:
+    def _display_frame(self, index: int) -> bool:
+        video, capture = self.current, self.capture
+        if video is None or capture is None:
+            return False
+        index = max(0, index)
+        if video.frame_count:
+            index = min(index, video.frame_count - 1)
+        if index == self.frame_index:
+            return True
+        if round(capture.get(cv2.CAP_PROP_POS_FRAMES)) != index:
+            if not capture.set(cv2.CAP_PROP_POS_FRAMES, index):
+                return False
+        ok, frame = capture.read()
+        if not ok:
+            return False
+        next_index = round(capture.get(cv2.CAP_PROP_POS_FRAMES))
+        self.frame_index = next_index - 1 if next_index > 0 else index
+        self.position = self.frame_index / video.fps if video.fps > 0 else 0.0
+        self._show_frame(frame)
+        self.marker.set_position(self.position)
+        self.time_label.configure(text=(
+            f"{format_time(self.position)} / {format_time(video.duration)}"
+            f"   Frame {self.frame_index + 1:,} of {video.frame_count:,}"
+        ))
+        return True
+
+    def _step_key(self, event: tk.Event, delta: int) -> str | None:
+        if not self.current or event.widget.winfo_toplevel() != self:
+            return None
+        if event.widget.winfo_class() in {
+            "Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox", "Scale", "TScale"
+        }:
+            return None
+        self._pause()
+        if not self._display_frame(self.frame_index + delta):
+            self._set_status("Could not decode the requested frame.", "error", True)
+        return "break"
+
+    def add_marker(self) -> None:
         if not self.current:
             return
-        target = self.position if seconds is None else seconds
-        # Avoid accidental duplicates within a tenth of a second.
-        if any(abs(match.seconds - target) < .1 for match in self.current.matches):
-            self._set_status(f"A marker already exists at {format_time(target)}.")
+        video = self.current
+        index = self.frame_index
+        if index < 0:
             return
-        self.current.matches.append(Match(target, 1.0, "Manual marker"))
-        self.current.matches.sort(key=lambda match: match.seconds)
-        self.marker.set_data(self.current.duration, self.current.matches, self.position)
-        self._set_status(f"Added marker at {format_time(target)}.")
+        if any(m.frame_index == index and m.source == "manual" for m in video.matches):
+            self._set_status(f"Frame {index + 1} already has a manual marker.")
+            return
+        video.matches = [m for m in video.matches if m.frame_index != index or m.source == "endpoint"]
+        video.matches.append(video.marker(index, "manual", "Manual marker"))
+        video.matches.sort(key=lambda m: m.frame_index)
+        self.marker.set_data(video.duration, video.matches, self.position)
+        self._set_status(f"Marked frame {index + 1}.")
 
     def remove_marker_near(self, seconds: float | None = None) -> None:
         if not self.current or not self.current.matches:
@@ -767,7 +837,10 @@ class MovieStillFinder(tk.Tk):
             if abs(nearest.seconds - target) > tolerance:
                 self._set_status("Right-click closer to a marker to remove it.")
                 return
-        self.current.matches.remove(nearest)
+        self.current.matches = [
+            match for match in self.current.matches if match.frame_index != nearest.frame_index
+        ]
+        self._set_end_matches(self.current, bool(self.include_ends.get()))
         self.marker.set_data(self.current.duration, self.current.matches, self.position)
         self._set_status(f"Removed marker at {format_time(nearest.seconds)}.")
 
@@ -775,12 +848,11 @@ class MovieStillFinder(tk.Tk):
         if not self.current:
             self._set_status("Select a movie first.")
             return
-        endpoint_reasons = {"First frame", "Last frame"}
         removed = sum(
-            match.reason not in endpoint_reasons for match in self.current.matches
+            match.source != "endpoint" for match in self.current.matches
         )
         self.current.matches = [
-            match for match in self.current.matches if match.reason in endpoint_reasons
+            match for match in self.current.matches if match.source == "endpoint"
         ]
         keep_endpoints = bool(self.include_ends.get())
         self._set_end_matches(self.current, keep_endpoints)
@@ -794,62 +866,82 @@ class MovieStillFinder(tk.Tk):
         )
 
     def _show_frame(self, frame: object) -> None:
+        width, height = self.video_canvas.winfo_width(), self.video_canvas.winfo_height()
+        h, w = frame.shape[:2]
+        scale = min(1.0, max(1, width - 4) / w, max(1, height - 4) / h)
+        if scale < 1:
+            frame = cv2.resize(frame, (max(1, round(w * scale)), max(1, round(h * scale))),
+                               interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        image = Image.fromarray(rgb)
-        max_w = max(320, self.video_canvas.winfo_width() - 4)
-        max_h = max(240, self.video_canvas.winfo_height() - 4)
-        image.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
-        self.photo = ImageTk.PhotoImage(image)
-        self.video_canvas.delete("all")
-        self.video_canvas.create_image(
-            self.video_canvas.winfo_width() / 2,
-            self.video_canvas.winfo_height() / 2,
-            image=self.photo,
-            anchor="center",
-        )
+        self.photo = ImageTk.PhotoImage(Image.fromarray(rgb))
+        if self.video_canvas.find_withtag("preview"):
+            self.video_canvas.itemconfigure("preview", image=self.photo)
+            self.video_canvas.coords("preview", width / 2, height / 2)
+        else:
+            self.video_canvas.delete("empty")
+            self.video_canvas.create_image(width / 2, height / 2, image=self.photo, tags="preview")
 
     def next_marker(self) -> None:
         if not self.current or not self.current.matches:
             self._set_status("There are no markers on this movie.")
             return
-        later = [match for match in self.current.matches if match.seconds > self.position + .05]
+        later = [match for match in self.current.matches if match.frame_index > self.frame_index]
         target = later[0] if later else self.current.matches[0]
-        self.seek(target.seconds)
+        self._pause()
+        self._display_frame(target.frame_index)
         self._set_status(f"Marker at {format_time(target.seconds)} — {target.reason}")
 
     def previous_marker(self) -> None:
         if not self.current or not self.current.matches:
             self._set_status("There are no markers on this movie.")
             return
-        earlier = [match for match in self.current.matches if match.seconds < self.position - .05]
+        earlier = [match for match in self.current.matches if match.frame_index < self.frame_index]
         target = earlier[-1] if earlier else self.current.matches[-1]
-        self.seek(target.seconds)
+        self._pause()
+        self._display_frame(target.frame_index)
         self._set_status(f"Marker at {format_time(target.seconds)} — {target.reason}")
 
+    def _pause(self) -> None:
+        if self.play_job is not None:
+            self.after_cancel(self.play_job)
+            self.play_job = None
+        self.playing = False
+        self.play_button.configure(text="▶ Play")
+
     def toggle_play(self) -> None:
-        if not self.current:
-            return
-        self.playing = not self.playing
-        self.play_button.configure(text="⏸ Pause" if self.playing else "▶ Play")
-        self.last_tick = time.monotonic()
         if self.playing:
-            self._play_tick()
+            self._pause()
+            return
+        if not self.current or self.current.fps <= 0:
+            return
+        if self.current.frame_count and self.frame_index == self.current.frame_count - 1:
+            if not self._display_frame(0):
+                return
+        self.playing = True
+        self.play_button.configure(text="⏸ Pause")
+        interval = 1 / self.current.fps
+        self.next_deadline = time.monotonic() + interval
+        self.play_job = self.after(max(1, round(interval * 1000)), self._play_tick)
 
     def _play_tick(self) -> None:
+        self.play_job = None
         if not self.playing or not self.current:
             return
+        target = self.frame_index + 1
+        if self.current.frame_count and target >= self.current.frame_count:
+            self._pause()
+            return
+        if not self._display_frame(target):
+            self._pause()
+            self._set_status("Playback stopped at the last readable frame.")
+            return
+        interval = 1 / self.current.fps
         now = time.monotonic()
-        self.position += now - self.last_tick
-        self.last_tick = now
-        if self.position >= self.current.duration:
-            self.position, self.playing = self.current.duration, False
-            self.play_button.configure(text="▶ Play")
-        self.seek(self.position)
-        if self.playing:
-            self.after(40, self._play_tick)
+        self.next_deadline = max(now, self.next_deadline + interval)
+        self.play_job = self.after(max(1, round((self.next_deadline - now) * 1000)), self._play_tick)
 
     def analyze(self) -> None:
-        self._begin_analysis(list(enumerate(self.videos)))
+        self._begin_analysis(list(self.videos))
 
     def analyze_selected(self) -> None:
         selected = self.file_list.curselection()
@@ -857,9 +949,9 @@ class MovieStillFinder(tk.Tk):
             messagebox.showwarning("No movie selected", "Select one movie in the Movies list first.")
             return
         index = selected[0]
-        self._begin_analysis([(index, self.videos[index])])
+        self._begin_analysis([self.videos[index]])
 
-    def _begin_analysis(self, targets: list[tuple[int, VideoItem]]) -> None:
+    def _begin_analysis(self, targets: list[VideoItem]) -> None:
         prompt = self.prompt.get("1.0", "end").strip()
         if not targets or not prompt:
             messagebox.showwarning("Nothing to analyze", "Add at least one movie and enter a search prompt.")
@@ -879,7 +971,6 @@ class MovieStillFinder(tk.Tk):
             max(.05, float(self.interval.get())),
             max(1, int(self.frame_interval.get())),
             float(self.threshold.get()),
-            bool(self.include_ends.get()),
             targets,
         )
         threading.Thread(target=self._analyze_worker, args=settings, daemon=True).start()
@@ -893,13 +984,14 @@ class MovieStillFinder(tk.Tk):
         seconds_interval: float,
         frame_interval: int,
         threshold: float,
-        include_ends: bool,
-        targets: list[tuple[int, VideoItem]],
+        targets: list[VideoItem],
     ) -> None:
         try:
             client = OpenAI(api_key=api_key)
-            for video_index, video in targets:
-                video.matches.clear()
+            results = []
+            for video in targets:
+                found = {}
+                sampled = False
                 if sample_mode == "frames":
                     if video.fps <= 0:
                         raise ValueError(f"Could not determine the frame rate for {video.path.name}")
@@ -923,12 +1015,15 @@ class MovieStillFinder(tk.Tk):
                             "Include only genuine visual matches. Confidence must be 0 to 1. Index is the supplied frame index."
                         ),
                     }]
-                    mapping: dict[int, float] = {}
+                    mapping: dict[int, int] = {}
                     for local_index, seconds in enumerate(batch):
-                        ok, frame = read_frame(video.path, seconds)
+                        index = video.index_at(seconds)
+                        ok, frame = read_frame_number(video.path, index)
                         if not ok:
                             continue
-                        mapping[local_index] = seconds
+                        sampled = True
+                        mapping[local_index] = index
+                        seconds = index / video.fps if video.fps else 0
                         content.append({"type": "input_text", "text": f"Frame index {local_index}, timestamp {seconds:.3f} seconds:"})
                         content.append({"type": "input_image", "image_url": frame_data_url(frame), "detail": "low"})
                     if not mapping:
@@ -943,14 +1038,15 @@ class MovieStillFinder(tk.Tk):
                         index = int(item.get("index", -1))
                         confidence = float(item.get("confidence", 0))
                         if index in mapping and confidence >= threshold:
-                            video.matches.append(Match(mapping[index], confidence, str(item.get("reason", "Match"))))
+                            frame_index = mapping[index]
+                            found[frame_index] = video.marker(frame_index, "search", str(item.get("reason", "Match")), confidence)
                     self.events.put(("progress", f"Analyzed {video.path.name}: {min(start + 12, len(times))}/{len(times)} samples"))
-                video.matches.sort(key=lambda m: m.seconds)
-                self._set_end_matches(video, include_ends)
-                self.events.put(("matches", video_index))
-            self.events.put(("analyze_done", (sum(len(video.matches) for _, video in targets), len(targets))))
+                if not sampled:
+                    raise ValueError(f"Could not sample {video.path.name}")
+                results.append((video, found))
+            self.events.put(("analyze_done", results))
         except Exception as exc:
-            self.events.put(("analyze_failed", str(exc)))
+            self.events.put(("analyze_failed", f"Search failed ({type(exc).__name__}). Your markers were kept."))
 
     def ask_recommendations(self) -> None:
         selected = self.file_list.curselection()
@@ -962,10 +1058,10 @@ class MovieStillFinder(tk.Tk):
             return
         video = self.videos[selected[0]]
         goal = self.prompt.get("1.0", "end").strip()
-        self.last_review_response_id = None
-        self.last_review_movie_name = video.path.name
-        self.last_review_video = video
-        self.recommend_button.configure(state="disabled")
+        if video.review.busy:
+            return
+        video.review.busy = True
+        self._review_buttons()
         self._set_status(f"Asking GPT to review {video.path.name}…")
         threading.Thread(
             target=self._recommendations_worker,
@@ -1006,18 +1102,19 @@ class MovieStillFinder(tk.Tk):
                     "The user's current still-finding goal is:\n" + (goal or "Not specified")
                 ),
             }]
-            frames_added = 0
+            samples = {}
             for index, seconds in enumerate(times):
-                ok, frame = read_frame(video.path, seconds)
+                frame_index = video.index_at(seconds)
+                ok, frame = read_frame_number(video.path, frame_index)
                 if not ok:
                     continue
-                frames_added += 1
+                samples[round(seconds, 3)] = frame_index
                 content.append({
                     "type": "input_text",
                     "text": f"Frame {index + 1}, timestamp {seconds:.3f} seconds:",
                 })
                 content.append({"type": "input_image", "image_url": frame_data_url(frame), "detail": "low"})
-            if frames_added == 0:
+            if not samples:
                 raise ValueError(f"Could not sample frames from {video.path.name}")
             response = client.responses.create(
                 model=model,
@@ -1025,14 +1122,15 @@ class MovieStillFinder(tk.Tk):
             )
             self.events.put((
                 "recommendations_done",
-                (video.path.name, response.output_text, response.id, frames_added, review_mode),
+                (video, response.output_text, response.id, samples, review_mode),
             ))
         except Exception as exc:
-            self.events.put(("recommendations_failed", str(exc)))
+            self.events.put(("review_failed", (video, type(exc).__name__)))
 
     def ask_followup(self) -> None:
         question = self.followup_text.get("1.0", "end").strip()
-        if not self.last_review_response_id:
+        video = self.current
+        if not video or not video.review.response_id:
             messagebox.showwarning("Review a movie first", "Click “GPT review selected” before asking a follow-up.")
             return
         if not question:
@@ -1041,71 +1139,76 @@ class MovieStillFinder(tk.Tk):
         if not self.api_key.get().strip():
             messagebox.showwarning("API key needed", "Enter an OpenAI API key or set OPENAI_API_KEY.")
             return
-        self.followup_button.configure(state="disabled")
-        self._set_status(f"Asking a follow-up about {self.last_review_movie_name}…")
+        if video.review.busy:
+            return
+        video.review.busy = True
+        self._review_buttons()
+        self._set_status(f"Asking a follow-up about {video.path.name}…")
         threading.Thread(
             target=self._followup_worker,
             args=(
-                question,
-                self.last_review_response_id,
+                video, question,
+                video.review.response_id,
                 self.api_key.get().strip(),
                 self.model.get().strip(),
             ),
             daemon=True,
         ).start()
 
-    def _followup_worker(self, question: str, previous_response_id: str, api_key: str, model: str) -> None:
+    def _followup_worker(self, video: VideoItem, question: str, previous_response_id: str, api_key: str, model: str) -> None:
         try:
             client = OpenAI(api_key=api_key)
             response = client.responses.create(
                 model=model,
                 previous_response_id=previous_response_id,
+                instructions="Use only previously supplied timestamps. Start each recommended frame line with MARKER: and its supplied timestamp in seconds.",
                 input=[{"role": "user", "content": [{"type": "input_text", "text": question}]}],
             )
-            self.events.put(("followup_done", (question, response.output_text, response.id)))
+            self.events.put(("followup_done", (video, question, response.output_text, response.id)))
         except Exception as exc:
-            self.events.put(("followup_failed", str(exc)))
+            self.events.put(("review_failed", (video, type(exc).__name__)))
+
+    def _review_buttons(self) -> None:
+        review = self.current.review if self.current else None
+        ready = review is not None and not review.busy
+        self.recommend_button.configure(state="normal" if ready else "disabled")
+        self.followup_button.configure(state="normal" if ready and review.response_id else "disabled")
+        self.use_recommendations_button.configure(state="normal" if ready and review.recommendations else "disabled")
+
+    def _show_review(self) -> None:
+        review = self.current.review if self.current else None
+        self.analysis_text.configure(state="normal")
+        self.analysis_text.delete("1.0", "end")
+        self.analysis_text.insert("1.0", review.transcript if review and review.transcript else "Select a movie and click GPT review selected.")
+        self.analysis_text.configure(state="disabled")
+        self.analysis_text.see("end")
+        self.followup_text.delete("1.0", "end")
+        if review:
+            self.followup_text.insert("1.0", review.draft)
+        self._review_buttons()
+
+    @staticmethod
+    def _record_recommendations(review: Review, answer: str) -> None:
+        for value in re.findall(r"(?im)^\s*(?:[-*]\s*)?MARKER\s*:\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)\b", answer):
+            index = review.samples.get(float(value))
+            if index is not None:
+                review.recommendations.add(index)
 
     def use_recommended_frames(self) -> None:
-        video = self.last_review_video
-        if not video or not any(video is item for item in self.videos):
-            messagebox.showwarning("Review a movie first", "Click “GPT review selected” before using recommendations.")
-            return
-        transcript = self.analysis_text.get("1.0", "end")
-        explicit = re.findall(
-            r"(?i)\bMARKER\s*:?\s*(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)\b",
-            transcript,
-        )
-        values = [float(value) for value in explicit]
-        if not values:
-            # Supports reviews created before the explicit MARKER format was added.
-            values.extend(
-                float(value)
-                for value in re.findall(
-                    r"(?i)(?<![\w.])(\d+(?:\.\d+)?)\s*(?:s|sec|seconds)\b",
-                    transcript,
-                )
-            )
-            for minutes, seconds in re.findall(r"(?<!\d)(\d{1,2}):(\d{2}(?:\.\d+)?)(?!\d)", transcript):
-                values.append(int(minutes) * 60 + float(seconds))
-        valid_times = sorted({round(value, 3) for value in values if 0 <= value <= video.duration})
-        if not valid_times:
-            self._set_status("No usable recommendation timestamps were found in the GPT conversation.", "error", True)
+        video = self.current
+        if not video or video.review.busy:
             return
         added = 0
-        for seconds in valid_times:
-            if any(abs(match.seconds - seconds) < .05 for match in video.matches):
+        for index in sorted(video.review.recommendations):
+            existing = [m for m in video.matches if m.frame_index == index]
+            if any(m.source in {"manual", "review"} for m in existing):
                 continue
-            video.matches.append(Match(seconds, 1.0, "GPT recommended frame"))
+            video.matches = [m for m in video.matches if m.frame_index != index or m.source == "endpoint"]
+            video.matches.append(video.marker(index, "review", "GPT recommended frame"))
             added += 1
-        video.matches.sort(key=lambda match: match.seconds)
-        if self.current is video:
-            self.marker.set_data(video.duration, video.matches, self.position)
-        self._set_status(
-            f"Added {added} GPT-recommended marker(s) to {video.path.name}; use Extract marked stills to save them.",
-            "success",
-            True,
-        )
+        video.matches.sort(key=lambda m: m.frame_index)
+        self.marker.set_data(video.duration, video.matches, self.position)
+        self._set_status(f"Added {added} reviewed frame(s) to {video.path.name}.", "success", True)
 
     def extract(self) -> None:
         if not self.videos:
@@ -1114,39 +1217,47 @@ class MovieStillFinder(tk.Tk):
         self.extract_button.configure(state="disabled")
         self._set_status("Extracting stills…")
         include_ends = bool(self.include_ends.get())
-        threading.Thread(target=self._extract_worker, args=(output, include_ends), daemon=True).start()
+        jobs = []
+        for video in self.videos:
+            self._set_end_matches(video, include_ends)
+            unique = {m.frame_index: m for m in video.matches}
+            unique.update((m.frame_index, m) for m in video.matches if m.source == "endpoint")
+            jobs.append((video.path, tuple(unique.values())))
+        threading.Thread(target=self._extract_worker, args=(output, jobs), daemon=True).start()
 
-    def _extract_worker(self, output: Path, include_ends: bool) -> None:
+    def _extract_worker(self, output: Path, jobs: list[tuple[Path, tuple[Match, ...]]]) -> None:
+        count = 0
         try:
             output.mkdir(parents=True, exist_ok=True)
-            count = 0
-            for video in self.videos:
-                self._set_end_matches(video, include_ends)
-                targets: list[tuple[float, str]] = []
-                for match in video.matches:
-                    if match.reason == "First frame":
-                        label = "first"
-                    elif match.reason == "Last frame":
-                        label = "last"
-                    else:
-                        label = f"match_{match.confidence:.2f}"
-                    targets.append((match.seconds, label))
-                for seconds, label in targets:
-                    if label == "first":
-                        ok, frame = read_frame_number(video.path, 0)
-                    elif label == "last" and video.frame_count > 0:
-                        ok, frame = read_frame_number(video.path, video.frame_count - 1)
-                    else:
-                        ok, frame = read_frame(video.path, seconds)
+            for path, matches in jobs:
+                for match in matches:
+                    ok, frame = read_frame_number(path, match.frame_index)
                     if not ok:
-                        continue
-                    filename = f"{safe_name(video.path.stem)}_{format_time(seconds).replace(':', '-')}_{safe_name(label)}.jpg"
-                    if not cv2.imwrite(str(output / filename), frame, [cv2.IMWRITE_JPEG_QUALITY, 95]):
-                        raise OSError(f"Could not write {filename}")
+                        raise OSError(f"Could not read frame {match.frame_index + 1} of {path.name}")
+                    ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
+                    if not ok:
+                        raise OSError(f"Could not encode frame {match.frame_index + 1}")
+                    label = match.reason.split()[0].lower() if match.source == "endpoint" else match.source
+                    stem = f"{safe_name(path.stem)}_frame_{match.frame_index + 1:08d}_{label}"
+                    suffix = 1
+                    while True:
+                        name = f"{stem}.jpg" if suffix == 1 else f"{stem}_{suffix}.jpg"
+                        try:
+                            stream = (output / name).open("xb")
+                        except FileExistsError:
+                            suffix += 1
+                            continue
+                        try:
+                            with stream:
+                                stream.write(data.tobytes())
+                        except OSError:
+                            (output / name).unlink(missing_ok=True)
+                            raise
+                        break
                     count += 1
             self.events.put(("extract_done", (count, output)))
         except Exception as exc:
-            self.events.put(("extract_failed", str(exc)))
+            self.events.put(("extract_failed", f"Saved {count} still(s) before the error. {exc}"))
 
     def _poll_events(self) -> None:
         try:
@@ -1161,55 +1272,58 @@ class MovieStillFinder(tk.Tk):
                         self.output_dir.set(str(value.path.parent))
                 elif kind == "index_done":
                     self._set_status(f"Indexed {len(self.videos)} movie(s).", "success", timestamp=True)
-                elif kind in {"error", "analyze_failed", "extract_failed", "recommendations_failed", "followup_failed"}:
-                    self.analyze_button.configure(state="normal")
-                    self.analyze_selected_button.configure(state="normal")
-                    self.recommend_button.configure(state="normal")
-                    self.followup_button.configure(state="normal")
-                    self.extract_button.configure(state="normal")
+                elif kind in {"error", "analyze_failed", "extract_failed"}:
+                    if kind == "analyze_failed":
+                        self.analyze_button.configure(state="normal")
+                        self.analyze_selected_button.configure(state="normal")
+                    if kind == "extract_failed":
+                        self.extract_button.configure(state="normal")
                     self._set_status(f"Error: {value}", "error", timestamp=True)
                 elif kind == "progress":
                     self._set_status(value)
-                elif kind == "matches":
-                    if self.current is self.videos[value]:
-                        self.marker.set_data(self.current.duration, self.current.matches, self.position)
                 elif kind == "analyze_done":
-                    total, video_count = value
+                    total = 0
+                    for video, found in value:
+                        if video not in self.videos:
+                            continue
+                        kept = [m for m in video.matches if m.source in {"manual", "review"}]
+                        occupied = {m.frame_index for m in kept}
+                        video.matches = kept + [m for i, m in found.items() if i not in occupied]
+                        self._set_end_matches(video, bool(self.include_ends.get()))
+                        total += len(found)
+                        if self.current is video:
+                            self.marker.set_data(video.duration, video.matches, self.position)
                     self.analyze_button.configure(state="normal")
                     self.analyze_selected_button.configure(state="normal")
-                    self._set_status(
-                        f"Analysis complete for {video_count} movie(s): {total} matching frame(s) found.",
-                        "success",
-                        timestamp=True,
-                    )
-                elif kind == "recommendations_done":
-                    movie_name, analysis, response_id, frames_reviewed, review_mode = value
-                    self.recommend_button.configure(state="normal")
-                    self.last_review_response_id = response_id
-                    self.last_review_movie_name = movie_name
-                    self.analysis_text.configure(state="normal")
-                    self.analysis_text.delete("1.0", "end")
-                    self.analysis_text.insert("1.0", analysis)
-                    self.analysis_text.configure(state="disabled")
-                    self._set_status(
-                        f"GPT review complete for {movie_name}: {frames_reviewed} frames via {review_mode} sampling.",
-                        "success",
-                        timestamp=True,
-                    )
-                elif kind == "followup_done":
-                    question, answer, response_id = value
-                    self.followup_button.configure(state="normal")
-                    self.last_review_response_id = response_id
-                    self.analysis_text.configure(state="normal")
-                    self.analysis_text.insert("end", f"\n\n{'─' * 42}\nYOU\n{question}\n\nGPT\n{answer}")
-                    self.analysis_text.see("end")
-                    self.analysis_text.configure(state="disabled")
-                    self.followup_text.delete("1.0", "end")
-                    self._set_status(
-                        f"GPT follow-up complete for {self.last_review_movie_name}.",
-                        "success",
-                        timestamp=True,
-                    )
+                    self._set_status(f"Search complete. Found {total} matching frame(s).", "success", True)
+                elif kind in {"recommendations_done", "followup_done", "review_failed"}:
+                    video = value[0]
+                    if video not in self.videos:
+                        continue
+                    review = video.review
+                    review.busy = False
+                    if kind == "review_failed":
+                        if self.current is video:
+                            self._review_buttons()
+                            self._set_status(f"GPT request failed for {video.path.name} ({value[1]}).", "error", True)
+                        continue
+                    if self.current is video:
+                        review.draft = self.followup_text.get("1.0", "end-1c")
+                    if kind == "recommendations_done":
+                        _, answer, review.response_id, review.samples, mode = value
+                        review.transcript = answer
+                        review.recommendations.clear()
+                        message = f"Reviewed {len(review.samples)} frames of {video.path.name} ({mode})."
+                    else:
+                        _, question, answer, review.response_id = value
+                        review.transcript += f"\n\nYOU\n{question}\n\nGPT\n{answer}"
+                        if review.draft.strip() == question:
+                            review.draft = ""
+                        message = f"Follow-up complete for {video.path.name}."
+                    self._record_recommendations(review, answer)
+                    if self.current is video:
+                        self._show_review()
+                        self._set_status(message, "success", True)
                 elif kind == "extract_done":
                     count, output = value
                     self.extract_button.configure(state="normal")
@@ -1223,7 +1337,7 @@ class MovieStillFinder(tk.Tk):
         self.after(100, self._poll_events)
 
     def _close(self) -> None:
-        self.playing = False
+        self._pause()
         if self.capture:
             self.capture.release()
         self.destroy()

@@ -19,3 +19,15 @@
 - Searchable in-app help describing every control
 - Secure API-key handling and GitHub exclusions
 - Project documentation and PyCharm setup instructions
+
+## Playback and importing
+
+- Reuse the selected movie decoder during playback and pace previews at the clip frame rate.
+- Step one frame with Left or Right and see the current frame number.
+- Drop movie files from Finder or File Explorer onto the main window.
+
+## Marker, export, and review fixes
+
+- Preserve manual and review picks across searches and preserve previous results on failure.
+- Mark and navigate adjacent frames. Export by frame number with overwrite protection.
+- Keep an independent in-memory conversation and verified recommendations for each movie.

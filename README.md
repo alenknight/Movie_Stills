@@ -49,7 +49,7 @@ GPT review sampling is configurable in the right pane. **Smart adaptive** combin
 
 Use **GPT review selected** at the lower left of **Continue the GPT conversation** to begin a review. Afterward, type a response or question there and click **Ask follow-up**. Follow-ups continue from the existing review without uploading the sampled frames again.
 
-Click and drag with the left mouse button anywhere on the timeline to scrub through the selected movie. **Add recommended frames to timeline** reads the timestamps in the GPT conversation and turns them into standard timeline markers on the reviewed movie; use **Extract marked stills** afterward to save those frames.
+Click and drag with the left mouse button anywhere on the timeline to scrub through the selected movie. **Add recommended frames to timeline** adds only GPT recommendations that match timestamps supplied for the selected movie; use **Extract marked stills** afterward to save those frames.
 
 When **Include first and last frames** is enabled, both endpoints appear as visible timeline markers, participate in previous/next marker navigation, and export with `first` and `last` in their filenames. The window sizes itself to the available display area; drag the pane dividers if more room is needed for video or GPT analysis.
 
@@ -62,3 +62,13 @@ The settings column reserves enough width for its labels at larger macOS/Windows
 Click the **?** button at the top-right to open a scrollable explanation of every control. Its live search field filters and highlights matching help entries as you type. Click **?** again or **Close help** inside the guide to dismiss it. A matching dark-background PDF guide is included in `output/pdf/Movie_Still_Finder_Help.pdf` with red alphabetical callouts and a full index.
 
 The app sends sampled JPEG frames—not the original movie—to OpenAI. Match timestamps are therefore accurate to the chosen sampling interval.
+
+Drop one or more movie files onto the main window from Finder or File Explorer. Click the preview, then press Left or Right to pause and step one frame. The frame counter starts at 1.
+
+### Keeping your picks
+
+Mark adjacent frames individually with **Add marker here**. The frame number in each JPEG filename matches the preview counter. Repeated exports and movies with the same name get a numeric suffix when needed. Each marked frame is exported once per run.
+
+A successful marker search replaces the previous search results for its target movies. Manual picks and frames you added from a GPT review are kept. A failed search leaves your markers intact.
+
+Each loaded movie has its own GPT review, follow-ups, and draft question. Switch movies to switch conversations. Only recommendations matching a timestamp actually supplied to GPT can become review markers. Closing the app clears the local session. Exported JPEGs stay in your output folder.

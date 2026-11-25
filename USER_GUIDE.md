@@ -248,7 +248,7 @@ Extraction processes all loaded movies.
 - Prompt-search markers are exported.
 - GPT-recommended markers are exported after they are added to the timeline.
 - Enabled first/last-frame markers are exported.
-- Output filenames identify the source movie and timestamp.
+- Output filenames identify the source movie and the exact frame number shown in the preview.
 
 Before extracting, review each movie, remove weak markers, confirm the output path, and verify the first/last-frame option.
 
@@ -284,7 +284,7 @@ The application reads source movies and writes separate still images. It does no
 | X | Continue conversation | Accepts a follow-up question or instruction. |
 | Y | GPT review selected | Reviews the selected movie. |
 | Z | Ask follow-up | Continues the current GPT review conversation. |
-| AA | Add recommended frames | Converts GPT timestamps into timeline markers. |
+| AA | Add recommended frames | Adds recommended frames that were sampled for the selected movie. |
 | AB | What should ChatGPT find? | Accepts the visual search prompt. |
 | AC | Include first and last frames | Keeps endpoint markers and extracts them. |
 | AD | Find markers - selected video | Searches only the highlighted movie. |
@@ -362,3 +362,15 @@ Fix responsive layout on smaller displays
 - [`Movie_Still_Finder_Help.pdf`](output/pdf/Movie_Still_Finder_Help.pdf) - printable dark user manual
 - [OpenAI API keys](https://help.openai.com/en/articles/4936850-where-do-i-find-my-openai-api-key)
 - [OpenAI API billing](https://help.openai.com/en/articles/9039756-managing-billing-settings-on-chatgpt-web-and-platform)
+
+### Drop files and inspect individual frames
+
+Drag movie files from Finder or File Explorer onto the main window. The app adds them to the Movies list just like **Add files**. Click the preview to give it keyboard focus. Press **Left** for the previous frame or **Right** for the next frame. Stepping pauses playback and stops at either end. The on-screen counter starts at frame 1. Click **Play** to resume.
+
+### Keeping your picks
+
+Mark adjacent frames individually with **Add marker here**. The frame number in each JPEG filename matches the preview counter. Repeated exports and movies with the same name get a numeric suffix when needed. Each marked frame is exported once per run.
+
+A successful marker search replaces the previous search results for its target movies. Manual picks and frames you added from a GPT review are kept. A failed search leaves your markers intact.
+
+Each loaded movie has its own GPT review, follow-ups, and draft question. Switch movies to switch conversations. Only recommendations matching a timestamp actually supplied to GPT can become review markers. Closing the app clears the local session. Exported JPEGs stay in your output folder.
